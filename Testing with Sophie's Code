@@ -1,0 +1,886 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+#Use this to clear the global environment
+remove(list = ls())
+```
+
+```{r}
+#Load all of these libraries first before running the program. These are all needed.
+library(stringr)
+library(sjstats)
+library(qvalue)
+library(pwr)
+library(qvalue)
+library (ggplot2)
+library(dplyr)
+
+#This one is only needed for the adjustment I made to sophie's data
+library(matrixStats)
+```
+
+```{r}
+#Functions to count features removed by condition, complete data analysis, and make plots.
+
+#This function will read and create dataframe from .gct or .csv files
+#Input filepath of data file that you want to read.
+#Output will be the raw dataframe of that file.
+read_plate <- function(plate) {
+  if (substr(plate, nchar(plate)-4+1, nchar(plate)) == ".gct") {
+    all_data <- read.table(plate, skip = 2, header = TRUE, sep = "\t")
+  } else if (substr(plate, nchar(plate)-4+1, nchar(plate)) == ".csv") {
+    all_data <- read.csv(plate, header = TRUE, sep = ",")
+  }
+  
+  return(all_data)
+}
+
+#This function will count and remove the necessary metadata columns and features.
+#Input the dataframe, a vector of metadata column names, and a vector of blocklisted column names.
+#Output will be a dataframe with the removed metadata and feature columns. A table of the number of removed features will be exported as well.
+#The total number of removed features may not equal the sum of all columns in the table because a given feature may fit into multiple categories. For example, a feature can be blocklisted but also have missing values.
+remove_features <- function(all_data, metadata_remove, blocklisted_features) {
+  #Define metadata columns based on column name.
+  metadata <- all_data[ ,grepl("Metadata_",colnames(all_data))]
+  #Remove specified metadata columns that won't be needed.
+  metadata <- metadata[ ,!colnames(metadata) %in% metadata_remove]
+  #Define non-metadata columns based on column name.
+  data <- all_data[ ,!grepl("Metadata_",colnames(all_data))]
+  #Ensure that data is numeric.
+  data[,] <- sapply(data[,],as.numeric)
+  #Change feature names from "ER" to "BODIPY." This is the naming convention that we use.
+  colnames(data) <- gsub("_ER", "_BODIPY", colnames(data))
+
+  #Define an empty table that we will fill with the counts of removed features.
+  number_removed_features <- matrix(0,nrow = 1, ncol = length(blocklisted_features)+3)
+  #Name the columns of the table.
+  colnames(number_removed_features) <- c("Total_number_of_removed_features", blocklisted_features, "missing_values", "sd_lessthan_0.5")
+  #COUNT FEATURES TO BE REMOVED
+  #Count the number of each blocklisted feature, and add to the table.
+  for(j in 1:length(blocklisted_features)) {
+    number_removed_features[1,j+1] <- ncol(data[ ,grepl(blocklisted_features[j], colnames(data))])
+  }
+  #Count the number of features with missing values, and add to the table.
+  number_removed_features[1,length(blocklisted_features)+2] <- ncol(data[ ,colSums(is.na(data)) == 0])
+  #Count the number of features with a standard deviation less than 0.5, and add to the table
+  #####I CHANGED THIS FOR THE COMPARISON WITH SOPHIE'S DATA####
+  #number_removed_features[1,length(blocklisted_features)+3] <- ncol(data[ ,sapply(data,sd) >= 0.5])
+  number_removed_features[1,length(blocklisted_features)+3] <- sum(colMeans(data) == 0)
+
+  #This will count the number of features that we start off with, so we can count how many total features get removed.
+  before <- ncol(data)
+  #REMOVE FEATURES
+  #Remove blocklisted features.
+  for(j in 1:length(blocklisted_features)) {
+    data <- data[ ,!grepl(blocklisted_features[j], colnames(data))]
+  }
+  #Remove columns with at least one NA.
+  #####data[,complete.cases(data)] didn't work here, so I tried this instead.
+  data <- data[ ,colSums(is.na(data)) == 0]
+  #Remove any features with a standard deviation less than 0.5. This will remove any features with all zeroes or any features that have essentially constant data. This prevents an error of too little variability when running the t-test later.
+  #####I CHANGED THIS FOR THE COMPARISON WITH SOPHIE'S DATA####
+  #data <- data[ ,sapply(data,sd) >= 0.5]
+  data <- data[ ,colMeans(data) != 0]
+  
+  #Find the total number of features that have been removed and add to the table.
+  number_removed_features[,"Total_number_of_removed_features"] <- before - ncol(data)
+  #Turn any NA values in the table to a zero.
+  number_removed_features[is.na(number_removed_features)] <- 0
+  #Export Table of Removed Features
+  #Make sure root output directory is correct and defined globally before running this function.
+  csv_path <- paste0(root_output_directory, "table_removed_features.csv")
+  write.table(number_removed_features, file = csv_path, sep = ",", col.names = NA)
+  
+  #Recombine the new metadata and data columns into a single data frame.
+  all_data_remove_features <- cbind(metadata, data)
+  #Return the new dataframe as the output of this function.
+  return(all_data_remove_features)
+}
+
+#Function for Data Analysis
+#Create "volcano" table of all the statistical analyses for each feature in a given condition.
+#Input a data frame of the control group and experimental group for a given comparison. Input a string specifying the title of the metadata column that you are comparing between the two groups. (For example, are you comparing the treatment conditions, oxygen levels, or donor?) Input a vector of features that you want to analyze and a label for the results file you will export.
+#Subsetting entire dataframe to define experimental and control groups happens outside of functions.
+new_data_analysis <- function(control_data, experimental_data, comparison, file_name) {
+  #Join control and experimental data into one data frame for linear regression.
+  #####For some reason, if I don't globally define this variable, I get an error message that "data_anova" doesn't exist.
+  data_anova <<- rbind(experimental_data,control_data)
+  #Ensure that all data (except for the metadata) is numeric.
+  data_anova[,!grepl("Metadata_",colnames(data_anova))] <- sapply(data_anova[,!grepl("Metadata_",colnames(data_anova))],as.numeric)
+  
+  #Define what variables to use in the linear regression based on the experimental comparison we are trying to run (treatment conditions, oxygen levels, donor, etc.). The plate should only be included as a variable if the samples in the comparison come from different plates.
+  #Define the column names for the data tables resulting from statistical analysis. Each variable will get its own set of statistical values (p-value, f-value, eta_sq), so the number of columns will vary depending on the number of variables.
+  #####I CHANGED THIS SO THAT row INSTEAD OF Metadata_Well WILL BE USED IN THE LINEAR REGRESSION. WHEN I TRIED TO USE THE WELL FOR LINEAR REGRESSION WITH THIS DATA, I GOT ALL NA P-VALUES AND F-VALUES.#####
+  if(length(unique(data_anova[ ,"Metadata_Plate"])) == 1) {
+    regression_variables <- paste0("data_anova[,i] ~ ", comparison, " + Metadata_row")
+    
+    p_colnames <- c("comparison.pvalue", "well.pvalue")
+    f_colnames <- c("comparison.fvalue", "well.fvalue")
+    effect_colnames <- c("comparison.eta_sq", "well.eta_sq")
+  } else {
+    regression_variables <- paste0("data_anova[,i] ~ ", comparison, " + Metadata_Plate + Metadata_row")
+    
+    p_colnames <- c("comparison.pvalue","plate.pvalue", "well.pvalue")
+    f_colnames <- c("comparison.fvalue", "plate.fvalue", "well.fvalue")
+    effect_colnames <- c("comparison.eta_sq",  "plate.eta_sq", "well.eta_sq")
+  }
+  
+  #Define lists for each of the statistical analyses. The q-values are determined based on the p-values, so there is not q-value list here.
+  lm_model<-list()
+  pvalue<-list()
+  fvalue<-list()
+  stats<-list()
+  ttest<-list()
+
+  #Define list of features
+  test_features <- colnames(data_anova)[!grepl("Metadata_",colnames(data_anova))]
+  for(i in test_features){
+    #Run linear regression of the previously defined variables.
+    lm <- eval(bquote(lm(regression_variables, data = data_anova)))
+    #Adding the ANOVA statistical test for this feature into the list
+    lm_model[[i]]<-anova(lm)
+    #Adding to separate lists of p-values, f-values, eta-squared values, and t-test values.
+    pvalue[[i]]<-lm_model[[i]][["Pr(>F)"]]
+    fvalue[[i]]<-lm_model[[i]][["F value"]]
+    stats[[i]]<-anova_stats(lm_model[[i]])
+    ttest[[i]]<-t.test(as.numeric(experimental_data[,i]), as.numeric(control_data[,i]))
+  }
+  
+  #For each statistical list, we need to convert to a data frame, remove the row of all NAs, transpose, and name the columns.   
+  pvalue_df<-do.call(cbind, pvalue)
+  pvalue_df <- as.data.frame(t(pvalue_df[rowSums(is.na(pvalue_df)) != ncol(pvalue_df), ]))
+  colnames(pvalue_df) <- p_colnames
+
+  #q-values are calculated based on the p-values
+  #####I ADDED THE pi0=1 ARGUMENT TO PREVENT AN ERROR MESSAGE####
+  #qvalues <- qvalue(pvalue_df$comparison.pvalue, pi0 = 1)
+  qvalues <- qvalue(pvalue_df$comparison.pvalue)
+  #The qvalue() function returns many values in its list. We want to select just the qvalues.
+  qvalues <- qvalues[["qvalues"]]
+  pvalue_df <- cbind(pvalue_df, qvalues)
+  colnames(pvalue_df) <- c(p_colnames, "comparison.qvalue")
+  
+  fvalue_df <- do.call(cbind, fvalue)
+  fvalue_df <- as.data.frame(t(fvalue_df[rowSums(is.na(fvalue_df)) != ncol(fvalue_df), ]))
+  colnames(fvalue_df) <- f_colnames
+  
+  #The anova_stats() function returns many values in its list. We want to select just the etasq value.
+  effect <- sapply(stats,function(x) x["etasq"])
+  effect_df <- do.call(cbind, effect)
+  effect_df <- as.data.frame(t(effect_df[rowSums(is.na(effect_df)) != ncol(effect_df), ]))
+  colnames(effect_df) <- effect_colnames
+  
+  ttest_df <- data.frame(matrix(unlist(ttest), nrow=length(ttest), byrow=T))
+  rownames(ttest_df) <- test_features
+  colnames(ttest_df) <- c("t-test", "df", "pvalue", "confin1", "confin2", "meanx", "meany", "diffmean", "stderr", "alternative", "method", "dataname")
+  
+  #We have p-values from each variable from the anova() function, but the t.test() function also calculates its own set of p-values. We will use the p-value from one of the anova() pvalues to make the volcano plots.
+  ttest_pvalue <- as.numeric(ttest_df$pvalue)
+  #q-values are calculated based on the p-values
+  ttest_qvalue <- qvalue(ttest_pvalue)
+  ttest_qvalue <-ttest_qvalue[["qvalues"]]
+  
+  ttest_FDR <- cbind(ttest_df[,"t-test"], ttest_pvalue, ttest_qvalue)
+  colnames(ttest_FDR)<-c("t-test", "ttest_pvalue","ttest_qvalue")
+  ttest_FDR[,] <- sapply(ttest_FDR[,],as.numeric)
+  
+  #Dataframe of all statistical analysis
+  #Add a new categotry based on the feature group
+  results_df <- cbind(pvalue_df, effect_df, fvalue_df, ttest_FDR, test_features)
+  results_df <- results_df %>%
+  dplyr::mutate(feature_color = 
+    ifelse(grepl("BODIPY", rownames(results_df)) & !grepl("AGP", rownames(results_df)) & !grepl("DNA", rownames(results_df)) & !grepl("Mito", rownames(results_df)),'Lipid',
+           ifelse(grepl("AGP", rownames(results_df)) & !grepl("BODIPY", rownames(results_df)) & !grepl("Mito", rownames(results_df)),'AGP',
+                  ifelse(grepl("Mito", rownames(results_df)) & !grepl("BODIPY", rownames(results_df)) & !grepl("AGP", rownames(results_df)) & !grepl("DNA", rownames(results_df)),'Mito',
+                         ifelse(grepl("DNA", rownames(results_df)) & !grepl("BODIPY", rownames(results_df)) & !grepl("Mito", rownames(results_df)),'DNA',
+                                ifelse(grepl("BODIPY", rownames(results_df)) & grepl("AGP", rownames(results_df)), 'Lipid/AGP',
+                                       ifelse(grepl("BODIPY", rownames(results_df)) & grepl("DNA", rownames(results_df)), 'Lipid/DNA',
+                                              ifelse(grepl("BODIPY", rownames(results_df)) & grepl("Mito", rownames(results_df)), 'Lipid/Mito',
+                                                     ifelse(grepl("AGP", rownames(results_df)) & grepl("Mito", rownames(results_df)), 'AGP/Mito',
+                                                            ifelse(grepl("DNA", rownames(results_df)) & grepl("Mito", rownames(results_df)), 'DNA/Mito',
+                                                                   'other'))))))))))
+
+  results_df$feature_color<-factor(results_df$feature_color, levels = c("Mito","AGP","Lipid","DNA", "Lipid/AGP", "Lipid/DNA", "Lipid/Mito", "AGP/Mito", "DNA/Mito", "other"))
+
+  results_df <- results_df[complete.cases(results_df), ]
+    
+  #Export CSV of statistical analysis
+  #root_output_directory needs to be defined globally before this function.
+  #Make sure that file path defined here is correct.
+  csv_path <- paste0(root_output_directory, "Statistical Tables/", file_name, "_StatisticalTable_LPprofile_hepatocytes.csv")
+  write.table(results_df, file = csv_path, sep = ",", col.names = NA, qmethod = "double")
+    
+  return(results_df)
+}
+
+#Functions for making plots (volcano plot, stacked bar graph, pie charts, histograms)
+
+#Volcano Plots
+#Points of combined features are same color as "other"
+#Input the data frame, whether you want to plot p-values or q-values on the y-axis, the max significant p- or q-value, the min significant t-test value, and a label for the file name.
+plot_volcano <- function(data2plot, p_or_q, ylim, xlim, file_name) {
+  if(deparse(substitute(p_or_q)) == "p") {
+    volcano_plot <<- ggplot(data2plot, aes(x= `t-test`, y=-log10(comparison.pvalue))) +
+      geom_point(aes(color=feature_color))+
+      scale_color_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db","Lipid/AGP"="#959ca3", "Lipid/DNA"="#959ca3", "Lipid/Mito"="#959ca3", "AGP/Mito"="#959ca3", "DNA/Mito"="#959ca3", "other"="#959ca3"))+
+      geom_hline(yintercept = -log10(ylim), linetype = "dashed") +
+      geom_vline(xintercept = c(-xlim,xlim), linetype = "dashed") +
+      ylab("-log10(pvalue)") +
+      ggtitle(paste0("pvalue Volcano Plot of ", file_name))
+    
+    #Export PDF of volcano plot
+    #root_output_directory needs to be defined globally before this function.
+    #Make sure that file path defined here is correct.
+    pdf_path <- paste0(root_output_directory, "Volcano Plots/", file_name, "_pvolcano_LP profile_hepatocytes.pdf")
+  } else if(deparse(substitute(p_or_q)) == "q") {
+    volcano_plot <<- ggplot(data2plot, aes(x= `t-test`, y=-log10(comparison.qvalue))) +
+      geom_point(aes(color=feature_color))+
+      scale_color_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db","Lipid/AGP"="#959ca3", "Lipid/DNA"="#959ca3", "Lipid/Mito"="#959ca3", "AGP/Mito"="#959ca3", "DNA/Mito"="#959ca3", "other"="#959ca3"))+
+      geom_hline(yintercept = -log10(ylim), linetype = "dashed") +
+      geom_vline(xintercept = c(-xlim,xlim), linetype = "dashed") +
+      ylab("-log10(qvalue)") +
+      ggtitle(paste0("pvalue Volcano Plot of ", file_name))
+    
+    #Export PDF of volcano plot
+    #root_output_directory needs to be defined globally before this function.
+    #Make sure that file path defined here is correct.
+    pdf_path <- paste0(root_output_directory, "Volcano Plots/", file_name, "_qvolcano_LP profile_hepatocytes.pdf")
+  }
+  
+  pdf(pdf_path)
+  print(volcano_plot)
+  dev.off()
+}
+
+#Stacked Bar Graph
+#Input data frame and label for file name.
+plot_stackedbar <- function (data2plot, file_name) {
+  #Filter out statistically insignificant points
+  stacked_data <- data2plot[data2plot$comparison.pvalue <= 0.01 & data2plot$comparison.qvalue <= 0.05 & abs(data2plot$`t-test`) > 0.5,]
+  
+  lbls <- c("Mito","AGP","Lipid","DNA", "Lipid/AGP", "Lipid/DNA", "Lipid/Mito", "AGP/Mito", "DNA/Mito", "other")
+  slices <- c()
+  for(b in 1:length(lbls)) {
+    slices[b] <- sum(stacked_data$feature_color == lbls[b])
+  }
+  stacked_data <- data.frame(group = lbls, value = slices)
+  ttl <- paste0("Stacked Bar Graph of Significant Points for ", file_name, ". ", as.character(sum(slices)), " Total points.")
+  
+  stackedbar_plot <- ggplot(stacked_data, aes(fill=group, y=value, x="")) +
+  geom_bar(position="fill", stat="identity") +
+  scale_fill_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db", "Lipid/AGP"="yellowgreen", "Lipid/DNA"="aquamarine3", "Lipid/Mito"="deeppink3", "AGP/Mito"="darkorange2", "DNA/Mito"="darkorchid3", "other"="#959ca3")) +
+  ggtitle(ttl) +
+  xlab("") +
+  ylab("")
+    
+  #Export PDF of stacked bar graph
+  #root_output_directory needs to be defined globally before this function.
+  #Make sure that file path defined here is correct.
+  pdf_path <- paste0(root_output_directory, "Stacked Bar Graphs/", file_name, "_stackedbar_LP profile_hepatocytes.pdf")
+  pdf(pdf_path)
+  print(stackedbar_plot)
+  dev.off()
+}
+
+#Pie Chart
+#Input data frame and label for file name.
+plot_piechart <- function (data2plot, file_name) {
+  #Filter out statistically insignificant points
+  pie_data <- data2plot[data2plot$comparison.pvalue <= 0.01 & data2plot$comparison.qvalue <= 0.05 & abs(data2plot$`t-test`) > 0.5,]
+  
+  lbls <- c("Mito","AGP","Lipid","DNA", "Lipid/AGP", "Lipid/DNA", "Lipid/Mito", "AGP/Mito", "DNA/Mito", "other")
+  slices <- c()
+  for(b in 1:length(lbls)) {
+    slices[b] <- sum(pie_data$feature_color == lbls[b])
+  }
+  pct <- round(slices/sum(slices)*100)
+  pie_data <- data.frame(group = lbls, value = slices)
+  ttl <- paste0("Pie Chart of Significant Points for ", file_name, ". ", as.character(sum(slices)), " Total points.")
+  
+  pie_chart <- ggplot(pie_data, aes(x="", y=value, fill = group)) +
+  geom_bar(stat="identity", width=1, color="white") + 
+  geom_text(aes(label = paste0(pct, "%")), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db", "Lipid/AGP"="yellowgreen", "Lipid/DNA"="aquamarine3", "Lipid/Mito"="deeppink3", "AGP/Mito"="darkorange2", "DNA/Mito"="darkorchid3", "other"="#959ca3"))+
+  coord_polar("y", start=0) + 
+  ggtitle(ttl) + 
+  theme_void()
+  
+  #Export PDF of Pie Chart
+  #root_output_directory needs to be defined globally before this function.
+  #Make sure that file path defined here is correct.
+  pdf_path <- paste0(root_output_directory, "Pie Charts/", file_name, "_piechart_LPprofile_hepatocytes.pdf")
+  pdf(pdf_path)
+  print(pie_chart)
+  dev.off()
+}
+
+#Histogram of qvalues
+#This will help to determine why we are seeing horizontal lines in the qvalue volcano plots.
+#Input data frame, whether you want a histogram of the q-values or -log10(qvalues) and label for file name.
+plot_qhistogram <- function(data2plot, q_or_log, file_name) {
+  if(deparse(substitute(q_or_log)) == "q") {
+    qhistogram <- ggplot(data2plot, aes(data2plot$comparison.qvalue)) +
+                         geom_histogram() +
+                         ggtitle(paste0("Histogram of qvalues for ", file_name)) +
+                         xlab("qvalue")
+    
+    #root_output_directory needs to be defined globally before this function.
+    #Make sure that file path defined here is correct.
+    pdf_path <- paste0(root_output_directory, "Histograms/", file_name, "_logqvalues_histogram_LP profile_hepatocytes.pdf")
+  } else if(deparse(substitute(q_or_log)) == "log") {
+    hist_data <- cbind(data2plot, -log10(data2plot$q))
+    colnames(hist_data) <- c(colnames(data2plot), "log_q")
+    qhistogram <- ggplot(hist_data, aes(hist_data$log_q)) +
+                         geom_histogram() +
+                         ggtitle(paste0("Histogram of -log(qvalue) for ", file_name)) +
+                         xlab("-log10(qvalue)")
+    
+    #root_output_directory needs to be defined globally before this function.
+    #Make sure that file path defined here is correct.
+    pdf_path <- paste0(root_output_directory, "Histograms/", file_name, "_logqvalues_histogram_LP profile_hepatocytes.pdf")
+  }
+  
+  #root_output_directory needs to be defined globally before this function.
+  #Make sure that file path defined here is correct.
+  pdf_path <- paste0(root_output_directory, "Histograms/", file_name, "_qvalues_histogram_LP profile_hepatocytes.pdf")
+  #Export histogram of qvalues
+  pdf(pdf_path)
+  print(qhistogram)
+  dev.off()
+}
+```
+
+```{r}
+#Comparing my code with Sophie's code using Sophie's old dataset. This is to check that I still get the same results as her every step along the way.
+#Step 1: Reading the datafiles
+
+#########SOPHIE'S CODE#########
+#Lipocyte Profiler om hepatocytes
+##set working directory###
+#setwd("/Users/sophiestrobel/Desktop/LP/Hepatocytes 2021")
+####load input data###
+#4% oxygen
+plate1<-"/Volumes/broad_mcl/members_dir/Maya_Jackson/data/Hepatocyte/Sophies_example_data/BR00101180_normalized.gct"
+data_low_oxygen<-read.table(plate1, skip = 2, header = TRUE, sep = "\t")
+#21% oxygen
+plate2<-"/Volumes/broad_mcl/members_dir/Maya_Jackson/data/Hepatocyte/Sophies_example_data/BR00101181_normalized.gct"
+data_normal_oxygen<-read.table(plate2, skip = 2, header = TRUE, sep = "\t")
+
+#########MY CODE#########
+root_output_directory <- "/Volumes/broad_mcl/members_dir/Maya_Jackson/test_for_maya/new_data_results/"
+my_data_low_ox <- read_plate(plate1)
+my_data_normal_ox <- read_plate(plate2)
+
+#########COMPARISON#########
+identical(data_low_oxygen, my_data_low_ox)
+identical(data_normal_oxygen, my_data_normal_ox)
+```
+
+```{r}
+#Comparing my code with Sophie's code using Sophie's old dataset. This is to check that I still get the same results as her every step along the way.
+#Step 2: Removing necessary features and preparing dataframe for analysis.
+
+#########SOPHIE'S CODE#########
+#4% oxygen
+df_low_oxygen<-as.data.frame(t(data_low_oxygen))
+colnames(df_low_oxygen)<-as.character(data_low_oxygen$id)
+df_low_oxygen<-df_low_oxygen[-c(1,2), ]                   
+#21% oxygen
+df_normal_oxygen<-as.data.frame(t(data_normal_oxygen))
+colnames(df_normal_oxygen)<-as.character(data_normal_oxygen$id)
+df_normal_oxygen<-df_normal_oxygen[-c(1,2), ]  
+#merge data plates
+data_hep<-rbind(df_low_oxygen, df_normal_oxygen)
+#define new variables column and well position in the well
+#library(stringr)
+well<-str_split_fixed(data_hep$Well, "[[:digit:]]", 2)
+colnames(well)<-c("row", "column")
+data_hep<-cbind(well, data_hep)
+#data_hep<-data_hep[, -c(3:8)]
+#meta<-data_hep[, 1:4]
+#input<-data_hep[, 5:3040]
+#####I CHANGED THIS INDEXING TO KEEP THE "WELL" COLUMN IN THE METADATA####
+data_hep<-data_hep[, -c(5:8)]
+######split data into meta and LP data###
+meta<-data_hep[, 1:6]
+input<-data_hep[, 7:3042]
+#LP data numeric
+input[,] <- sapply(sapply(input[,], as.character),as.numeric) 
+#ER to BODIPY
+colnames(input) <- gsub("_ER", "_BODIPY", colnames(input))
+#filter data, remove blocklisted features, SmallBODIPY objects and features with 0´s or NA´s across all samples
+#see methods LP manuscripte Laber and Strobel et al.
+back<-as.data.frame(t(input))
+var.selection.1<-back[!grepl( "_Costes_" , rownames(back) ) ,  ]
+var.selection.2<-var.selection.1[!grepl( "_Manders_" , rownames(var.selection.1)) ,  ]
+var.selection.3<-var.selection.2[!grepl( "_RWC_" , rownames(var.selection.2)) ,  ]
+var.selection.4<-var.selection.3[!grepl( "SmallBODIPY" , rownames(var.selection.3) ) ,  ]
+#########remove LP features with 0´s or NA´s across data###
+mean<-rowMeans(var.selection.4)
+var<-cbind(mean, var.selection.4)
+var.1<-subset(var, var$mean != "0")
+#####I CHANGED THIS TO REMOVE THE SD < 0.5 RATHER THAN MEANS OF ZERO, SO THAT BOTH DATA SETS ARE DOING THE SAME THING
+#sd<-rowSds(as.matrix(var.selection.4))
+#var<-cbind(sd, var.selection.4)
+#var.1<-subset(var, as.numeric(var$sd) >= 0.5)
+var.1a<- var.1[complete.cases(var.1), ]
+#adj n number
+variables<-as.data.frame(t(var.1a[,2:145]))
+#merge data
+df<-cbind(meta, variables)
+
+#########MY CODE#########
+#These steps are fixing the old data frame to match the format of the new dataframe, so I can run my data analysis function on it.
+#Transpose, remove extra columns of metadata, make features column names, remove extra rows of feature names, and change the names of the metadata columns.
+my_data_low_ox <- as.data.frame(t(my_data_low_ox))
+my_data_low_ox<-my_data_low_ox[, -c(3,4,5)]
+colnames_my_data_low_ox<-as.character(my_data_low_ox["id",])
+my_data_low_ox<-my_data_low_ox[-c(1,2),]
+colnames(my_data_low_ox)<-colnames_my_data_low_ox
+colnames(my_data_low_ox)[colnames(my_data_low_ox) == c("Plate", "Well", "cell_line", "condition_O2", "treatment")] <- c("Metadata_Plate", "Metadata_Well", "Metadata_Cell.Type", "Metadata_Oxygen", "Metadata_Treatments")
+my_data_normal_ox <- as.data.frame(t(my_data_normal_ox))
+my_data_normal_ox<-my_data_normal_ox[, -c(3,4,5)]
+colnames_my_data_normal_ox<-as.character(my_data_normal_ox["id",])
+my_data_normal_ox<-my_data_normal_ox[-c(1,2),]
+colnames(my_data_normal_ox)<-colnames_my_data_normal_ox
+colnames(my_data_normal_ox)[colnames(my_data_normal_ox) == c("Plate", "Well", "cell_line", "condition_O2", "treatment")] <- c("Metadata_Plate", "Metadata_Well", "Metadata_Cell.Type", "Metadata_Oxygen", "Metadata_Treatments")
+#Combine low and normal oxygen frames into one dataframe.
+my_all_data <- rbind(my_data_low_ox, my_data_normal_ox)
+#Add metadata columns for the row and column of the well on the plate. This is needed to use the row as a variable in the linear regression.
+well<-str_split_fixed(my_all_data$Metadata_Well, "[[:digit:]]", 2)
+colnames(well)<-c("Metadata_row", "Metadata_column")
+my_all_data<-cbind(well, my_all_data)
+#I changed which metadata and blocklisted features to remove to match Sophie's analysis of this data.
+my_metadata_remove <- c("Metadata_Cell.Type")
+my_blocklisted_features <- c("_Costes_", "_Manders_" , "_RWC_", "SmallBODIPY")
+my_removed_all_data <- remove_features(my_all_data, my_metadata_remove, my_blocklisted_features)
+
+#########COMPARISON#########
+#my_numeric_data <- my_all_data[ ,!grepl("Metadata_",colnames(my_all_data))]
+#my_numeric_data[,] <- sapply(my_numeric_data[,], as.numeric)
+#identical(input, my_numeric_data)
+
+my_removed_all_data2<-my_removed_all_data[ ,!grepl("Metadata_",colnames(my_removed_all_data))]
+identical(variables, my_removed_all_data2)
+#I also compared the metadata visually. It was slightly different because Sophie's code considers the row and column of the plate separately from the well of the plate.
+
+#features in common between Sophie's and my analysis
+identical(rownames(variables), rownames(my_removed_all_data2))
+common_features <- intersect(rownames(variables), rownames(my_removed_all_data2))
+#Reorder the rows of both dataframes to be in the same order
+variables <- variables[order(row.names(variables)), ]
+my_removed_all_data2 <- my_removed_all_data2[order(row.names(my_removed_all_data2)), ]
+
+#Scatter plot of feature values
+featdata <- as.data.frame(cbind(colMeans(my_removed_all_data2), colMeans(variables)))
+colnames(featdata) <- c("my_featvalues", "sophies_featvalues")
+scatter_plot_featvalues <- ggplot(featdata, aes(x=my_featvalues, y=sophies_featvalues)) +
+  geom_point(size=.5) +
+  geom_smooth(method=lm, se=FALSE, color="red") +
+  ggtitle(paste0("Correlation Scatter Plot for 0.3mM OA Treatment at 21% Oxygen")) +
+  xlab("My feature values") +
+  ylab("Sophie's feature values")
+
+  #Export scatter plot as PDF
+  pdf_path <- paste0(root_output_directory, "Scatter Plots/", "_featScatter_LPprofile_21O2_0.3mMOA_hepatocytes.pdf")
+  pdf(pdf_path)
+  print(scatter_plot_featvalues)
+  dev.off()
+```
+
+```{r}
+#Comparing my code with Sophie's code using Sophie's old dataset. This is to check that I still get the same results as her every step along the way.
+#Step 3: Defining experimental and control groups
+
+#MAY NEED TO COME BACK AND CHANGE SOPHIE'S ANALYSIS TO NOT CONSIDER ROW OR COLUMN DIFFERENTLY IN THE LINEAR REGRESSION.
+#########SOPHIE'S CODE#########
+#choose condition to analyse
+normal<-subset(df, df$condition_O2== "21")
+#choose drug to analyse
+#split into treatment group and control group
+#1uM Rotenone
+#0.5mM DMOG
+#5mM metformin
+#0.3mM OA
+case<-subset(normal, normal$treatment == "0.3mM OA" )
+control<-subset(normal, normal$treatment == "CP CTRL")
+
+#########MY CODE#########
+#SUBSET THE SAME OXYGEN LEVEL AND EXPERIMENTAL AND CONTROL CONDITIONS
+my_normal<-my_removed_all_data[my_removed_all_data[,"Metadata_Oxygen"] == "21",]
+my_experimental<-my_normal[my_normal[,"Metadata_Treatments"] == "0.3mM OA",]
+my_control<-my_normal[my_normal[,"Metadata_Treatments"] == "CP CTRL",]
+
+#########COMPARISON#########
+#COMPARE THE NUMERIC DATA IN THE EXPERIMENTAL AND CONTROL GROUPS (METADATA)
+identical(normal[,7:2743], my_normal[ ,!grepl("Metadata_",colnames(my_normal))])
+identical(case[,7:2743], my_experimental[ ,!grepl("Metadata_",colnames(my_experimental))])
+identical(control[,7:2743], my_control[ ,!grepl("Metadata_",colnames(my_control))])
+```
+
+```{r}
+#Comparing my code with Sophie's code using Sophie's old dataset. This is to check that I still get the same results as her every step along the way.
+#Step 4: Completing data analysis.
+
+#########SOPHIE'S CODE#########
+#build matrix for anova
+data_anov<-rbind(case, control)
+#as numeric features data, change range depending on input
+#data_anov[,5:2741] <- sapply(sapply(data_anov[,5:2741], as.character),as.numeric) 
+#####I CHANGED THIS INDEXING TO KEEP THE "WELL" COLUMN IN THE METADATA####
+data_anov[,7:2743] <- sapply(sapply(data_anov[,7:2743], as.character),as.numeric) 
+#define variables you want to test#
+colvector<-as.character(colnames(variables))
+#ANOVA
+#library(sjstats)
+lm_model<-list()
+for(i in colvector){
+  lm <- lm(data_anov[,i] ~ treatment
+                          + row, 
+                           data = data_anov)
+  lm_model[[i]]<-anova(lm)
+}
+#extract p-values
+pvalue<-list()
+for(i in colvector){
+  pvalue[[i]]<-lm_model[[i]][["Pr(>F)"]]
+}
+#structure pvalue dataframe
+pvalue_df<-do.call(cbind, pvalue)
+pvalue_df_1<-as.data.frame(t(pvalue_df))
+pvalue_df_1<-pvalue_df_1[, -3]
+colnames(pvalue_df_1)<-c("treat.pvalue","pos.pvalue")
+##################calculate q-values (FDR)
+#library(qvalue)
+p<-pvalue_df_1$treat.pvalue
+qvalues<-qvalue(p)
+#hist(qvalues)
+q<-qvalues[["qvalues"]]
+##########combine q-values and p-values
+pvalue_data<-cbind(pvalue_df_1, q)
+##############extract F value
+Fvalue<-list()
+for(i in colvector){
+  Fvalue[[i]]<-lm_model[[i]][["F value"]]
+}
+Fvalue_df<-do.call(cbind, Fvalue)
+Fvalue_df_1<-as.data.frame(t(Fvalue_df))
+Fvalue_df_1<-Fvalue_df_1[, -3]
+colnames(Fvalue_df_1)<-c("treat.Fvalue", "pos.F")
+#############extract effect size eta_sq
+stats<-list()
+for(i in colvector){
+  stats[[i]]<-anova_stats(lm_model[[i]])
+}
+effect<-sapply(stats,function(x) x[7])
+effect_df<-do.call(cbind, effect)
+effect_df_1<-as.data.frame(t(effect_df))
+effect_df_1<-effect_df_1[, -3]
+colnames(effect_df_1)<-c("treat.eta_sq",  "pos.eta_sq")
+features<-colvector
+#t-test to calculate t-statistic
+#####as numeric and as.matrix case and control dataframe
+#mcluster<-control[,5:2741]
+#####I CHANGED THIS INDEXING TO KEEP THE "WELL" COLUMN IN THE METADATA####
+mcluster<-control[,7:2743]
+mcluster[,] <- sapply(sapply(mcluster[,], as.character),as.numeric) 
+matrixcontrol<-as.matrix(mcluster)
+#######numeric matrix case 
+#mcluster<-case[,5:2741]
+#####I CHANGED THIS INDEXING TO KEEP THE "WELL" COLUMN IN THE METADATA####
+mcluster<-case[,7:2743]
+mcluster[,] <- sapply(sapply(mcluster[,], as.character),as.numeric) 
+matrixcase<-as.matrix(mcluster)
+##t-test###
+outtest<- list ()
+for(i in colvector){
+  x<-matrixcase[,i]
+  y<-matrixcontrol[,i]
+  outtest[[i]]<-t.test(x,y)
+}
+pvalue_ttest <- data.frame(matrix(unlist(outtest), nrow=length(outtest), byrow=T))
+rownames(pvalue_ttest)<-colvector
+colnames(pvalue_ttest)<-c("t-test", "df", "pvalue", "confin1", "confin2", "meanx", "meany", "diffmean", "stderr", "alternative", "method", "dataname")
+#calculate qvalue, FDR
+#library(qvalue)
+p<- as.numeric(as.character(pvalue_ttest$pvalue))
+qvalues<-qvalue(p)
+#hist(qvalues)
+q<-qvalues[["qvalues"]]
+######### combine q-value, p-value and t-statistics
+pFDR<-cbind(p, q, pvalue_ttest)
+ttest_pFDR<-as.data.frame(t(pFDR))
+##############structure
+ttest_pFDR<-rbind(ttest_pFDR["t-test",],ttest_pFDR["p",],ttest_pFDR["q",] )
+ttest_pFDR<-as.data.frame(t(ttest_pFDR))
+colnames(ttest_pFDR)<-c("t-test", "p","qvalue")
+ttest_pFDR[,] <- sapply(sapply(ttest_pFDR[,], as.character),as.numeric) 
+##########combine anova an ttest in one output file
+volcano<-cbind(pvalue_data, effect_df_1, Fvalue_df_1 , ttest_pFDR, features )
+#plot  volcano
+#assign  categories to channel
+volcano <- volcano %>%
+  dplyr::mutate(feature_color = 
+                  ifelse(grepl("BODIPY", rownames(volcano)),'Lipid', 
+                         ifelse(grepl("AGP", rownames(volcano)),'AGP', 
+                                ifelse(grepl("Mito", rownames(volcano)),'Mito',
+                                       ifelse(grepl("DNA", rownames(volcano)),'DNA',
+                                              'other')))))
+volcano$feature_color<-factor(volcano$feature_color,
+                              levels = c("Mito","AGP","Lipid","DNA", "other"))
+#delete NA´s
+volcano<- volcano[complete.cases(volcano), ]
+#set signifance level
+volcano <- volcano %>%
+  dplyr::mutate(feature_sig = 
+                  ifelse(volcano$treat.pvalue  <= 0.05 &  volcano$q <= 0.001,'0.1%FDR',
+                         ifelse(volcano$p  <= 0.05 &  volcano$q <= 0.01,'1%FDR',
+                         'not')))
+
+#########MY CODE#########
+#my_volcano <- new_data_analysis(my_control, my_experimental, "Metadata_Treatments", "MY_VOLCANO")
+#FUNCTION ISN'T WORKING
+#Errorin smooth.spline(lambda, pi0, df = smooth.df) : missing or infinite values in inputs are not allowed
+
+#########MY CODE WITHOUT FUNCTION#########
+comparison <- "Metadata_Treatments"
+experimental_data <-my_experimental
+control_data<-my_control
+data_anova <- rbind(experimental_data,control_data)
+  #Ensure that all data (except for the metadata) is numeric.
+  data_anova[,!grepl("Metadata_",colnames(data_anova))] <- sapply(sapply(data_anova[,!grepl("Metadata_",colnames(data_anova))],as.character), as.numeric)
+  
+  #Define what variables to use in the linear regression based on the experimental comparison we are trying to run (treatment conditions, oxygen levels, donor, etc.). The plate should only be included as a variable if the samples in the comparison come from different plates.
+  #Define the column names for the data tables resulting from statistical analysis. Each variable will get its own set of statistical values (p-value, f-value, eta_sq), so the number of columns will vary depending on the number of variables.
+  if(length(unique(data_anova[ ,"Metadata_Plate"])) == 1) {
+    regression_variables <- paste0("data_anova[,i] ~ ", comparison, " + Metadata_row")
+    
+    p_colnames <- c("comparison.pvalue", "well.pvalue")
+    f_colnames <- c("comparison.fvalue", "well.fvalue")
+    effect_colnames <- c("comparison.eta_sq", "well.eta_sq")
+  } else {
+    regression_variables <- paste0("data_anova[,i] ~ ", comparison, " + Metadata_Plate + Metadata_row")
+    
+    p_colnames <- c("comparison.pvalue","plate.pvalue", "well.pvalue")
+    f_colnames <- c("comparison.fvalue", "plate.fvalue", "well.fvalue")
+    effect_colnames <- c("comparison.eta_sq",  "plate.eta_sq", "well.eta_sq")
+  }
+  
+  #Define lists for each of the statistical analyses. The q-values are determined based on the p-values, so there is not q-value list here.
+  my_lm_model<-list()
+  my_pvalue<-list()
+  my_fvalue<-list()
+  my_stats<-list()
+  my_ttest<-list()
+
+  #Define list of features
+  test_features <- colnames(data_anova)[!grepl("Metadata_",colnames(data_anova))]
+  for(i in test_features){
+    #Run linear regression of the previously defined variables.
+    lm <- lm(regression_variables, data = data_anova)
+    #Adding the ANOVA statistical test for this feature into the list
+    my_lm_model[[i]]<-anova(lm)
+    #Adding to separate lists of p-values, f-values, eta-squared values, and t-test values.
+    my_pvalue[[i]]<-my_lm_model[[i]][["Pr(>F)"]]
+    my_fvalue[[i]]<-my_lm_model[[i]][["F value"]]
+    my_stats[[i]]<-anova_stats(my_lm_model[[i]])
+    my_ttest[[i]]<-t.test(as.numeric(experimental_data[,i]), as.numeric(control_data[,i]))
+  }
+  
+  #For each statistical list, we need to convert to a data frame, remove the row of all NAs, transpose, and name the columns.   
+  my_pvalue_df<-do.call(cbind, my_pvalue)
+  my_pvalue_df <- as.data.frame(t(my_pvalue_df[rowSums(is.na(my_pvalue_df)) != ncol(my_pvalue_df), ]))
+  colnames(my_pvalue_df) <- p_colnames
+
+  #q-values are calculated based on the p-values
+  my_qvalues <- qvalue(my_pvalue_df$comparison.pvalue)
+  #The qvalue() function returns many values in its list. We want to select just the qvalues.
+  my_qvalues <- my_qvalues[["qvalues"]]
+  my_pvalue_df <- cbind(my_pvalue_df, my_qvalues)
+  colnames(my_pvalue_df) <- c(p_colnames, "comparison.qvalue")
+  
+  my_fvalue_df <- do.call(cbind, my_fvalue)
+  my_fvalue_df <- as.data.frame(t(my_fvalue_df[rowSums(is.na(my_fvalue_df)) != ncol(my_fvalue_df), ]))
+  colnames(my_fvalue_df) <- f_colnames
+  
+  #The anova_stats() function returns many values in its list. We want to select just the etasq value.
+  my_effect <- sapply(my_stats,function(x) x["etasq"])
+  my_effect_df <- do.call(cbind, my_effect)
+  my_effect_df <- as.data.frame(t(my_effect_df[rowSums(is.na(my_effect_df)) != ncol(my_effect_df), ]))
+  colnames(my_effect_df) <- effect_colnames
+  
+  my_ttest_df <- data.frame(matrix(unlist(my_ttest), nrow=length(my_ttest), byrow=T))
+  rownames(my_ttest_df) <- test_features
+  colnames(my_ttest_df) <- c("t-test", "df", "pvalue", "confin1", "confin2", "meanx", "meany", "diffmean", "stderr", "alternative", "method", "dataname")
+  
+  #We have p-values from each variable from the anova() function, but the t.test() function also calculates its own set of p-values. We will use the p-value from one of the anova() pvalues to make the volcano plots.
+  my_ttest_pvalue <- as.numeric(my_ttest_df$pvalue)
+  #q-values are calculated based on the p-values
+  my_ttest_qvalue <- qvalue(my_ttest_pvalue)
+  my_ttest_qvalue <-my_ttest_qvalue[["qvalues"]]
+  
+  my_ttest_FDR <- cbind(my_ttest_df[,"t-test"], my_ttest_pvalue, my_ttest_qvalue)
+  colnames(my_ttest_FDR)<-c("t-test", "ttest_pvalue","ttest_qvalue")
+  my_ttest_FDR[,] <- sapply(my_ttest_FDR[,],as.numeric)
+  
+  #Dataframe of all statistical analysis
+  #Add a new categotry based on the feature group
+  my_results_df <- cbind(my_pvalue_df, my_effect_df, my_fvalue_df, my_ttest_FDR, test_features)
+  my_results_df <- my_results_df %>%
+  dplyr::mutate(feature_color = 
+    ifelse(grepl("BODIPY", rownames(my_results_df)) & !grepl("AGP", rownames(my_results_df)) & !grepl("DNA", rownames(my_results_df)) & !grepl("Mito", rownames(my_results_df)),'Lipid',
+           ifelse(grepl("AGP", rownames(my_results_df)) & !grepl("BODIPY", rownames(my_results_df)) & !grepl("Mito", rownames(my_results_df)),'AGP',
+                  ifelse(grepl("Mito", rownames(my_results_df)) & !grepl("BODIPY", rownames(my_results_df)) & !grepl("AGP", rownames(my_results_df)) & !grepl("DNA", rownames(my_results_df)),'Mito',
+                         ifelse(grepl("DNA", rownames(my_results_df)) & !grepl("BODIPY", rownames(my_results_df)) & !grepl("Mito", rownames(my_results_df)),'DNA',
+                                ifelse(grepl("BODIPY", rownames(my_results_df)) & grepl("AGP", rownames(my_results_df)), 'Lipid/AGP',
+                                       ifelse(grepl("BODIPY", rownames(my_results_df)) & grepl("DNA", rownames(my_results_df)), 'Lipid/DNA',
+                                              ifelse(grepl("BODIPY", rownames(my_results_df)) & grepl("Mito", rownames(my_results_df)), 'Lipid/Mito',
+                                                     ifelse(grepl("AGP", rownames(my_results_df)) & grepl("Mito", rownames(my_results_df)), 'AGP/Mito',
+                                                            ifelse(grepl("DNA", rownames(my_results_df)) & grepl("Mito", rownames(my_results_df)), 'DNA/Mito',
+                                                                   'other'))))))))))
+
+  my_results_df$feature_color<-factor(my_results_df$feature_color, levels = c("Mito","AGP","Lipid","DNA", "Lipid/AGP", "Lipid/DNA", "Lipid/Mito", "AGP/Mito", "DNA/Mito", "other"))
+
+  my_results_df <- my_results_df[complete.cases(my_results_df), ]
+
+#########COMPARISON#########
+#identical(volcano, my_volcano)
+#my_results_df2 <- my_results_df
+#colnames(my_results_df2)<-colnames(volcano[,1:11])
+#identical(volcano[,1:11],my_results_df[,1:11])
+
+#features in common between Sophie's and my analysis
+identical(rownames(volcano), rownames(my_results_df))
+common_features <- intersect(rownames(volcano), rownames(my_results_df))
+#Reorder the rows of both dataframes to be in the same order
+volcano <- volcano[order(row.names(volcano)), ]
+my_results_df <- my_results_df[order(row.names(my_results_df)), ]
+
+#Scatter plot of pvalues
+pdata <- as.data.frame(cbind(my_results_df$comparison.pvalue, volcano$treat.pvalue))
+colnames(pdata) <- c("my_pvalues", "sophies_pvalues")
+scatter_plot_pvalues <- ggplot(pdata, aes(x=my_pvalues, y=sophies_pvalues)) +
+  geom_point(size=.1,alpha=.05) +
+  geom_smooth(method=lm, se=FALSE, color="red") +
+  ggtitle(paste0("Correlation Scatter Plot for 0.3mM OA Treatment at 21% Oxygen")) +
+  xlab("My pvalues") +
+  ylab("Sophie's pvalues")
+
+  #Export scatter plot as PDF
+  pdf_path <- paste0(root_output_directory, "Scatter Plots/", "_pvalueScatter_LPprofile_21O2_0.3mMOA_hepatocytes.pdf")
+  pdf(pdf_path)
+  print(scatter_plot_pvalues)
+  dev.off()
+
+#Scatter plot of qvalues
+qdata <- as.data.frame(cbind(my_results_df$comparison.qvalue, volcano$q))
+colnames(qdata) <- c("my_qvalues", "sophies_qvalues")
+scatter_plot_qvalues <- ggplot(qdata, aes(x=my_qvalues, y=sophies_qvalues)) +
+  geom_point(size=.1,alpha=.05) +
+  geom_smooth(method=lm, se=FALSE, color="red") +
+  ggtitle(paste0("Correlation Scatter Plot for 0.3mM OA Treatment at 21% Oxygen")) +
+  xlab("My qvalues") +
+  ylab("Sophie's qvalues")
+
+  #Export scatter plot as PDF
+  pdf_path <- paste0(root_output_directory, "Scatter Plots/", "_qvalueScatter_LPprofile_21O2_0.3mMOA_hepatocytes.pdf")
+  pdf(pdf_path)
+  print(scatter_plot_qvalues)
+  dev.off()
+
+#COMPARE VOLCANO RESULTS FILES
+#CHECK WHAT FEATURE VALUES ARE IN COMMON BETWEEN THE TWO ANALYSES
+#EXPORT SCATTER PLOTS OF PVALUES AND FEATURE VALUES
+
+```
+
+```{r}
+#Comparing my code with Sophie's code using Sophie's old dataset. This is to check that I still get the same results as her every step along the way.
+#Step 5: Making volcano plot and histogram.
+
+#########SOPHIE'S CODE#########
+#plot
+#library (ggplot2)
+#####I CHANGED THIS SO THAT THE VOLCANO PLOT DOESN'T CHANGE THE SIZE AND OPACITY OF THE POINTS BASED ON FDR AND SO THAT COLORS ARE BASED OFF OF FEATURE GROUP#####
+plot <- ggplot(volcano, aes(x= `t-test`, y=-log10(treat.pvalue ))) +
+              #geom_point(aes(color=feature_color,
+                 #size = feature_sig,
+                 #alpha = feature_sig ))+
+              geom_point(aes(color=feature_color))+
+            xlab("t-statistics") +
+            ylab("-log10 p-value") +
+            #ylim(0,9)+
+            #xlim(-100,100)+
+            #scale_size_manual(name = "", 
+                    #values = c("0.1%FDR" = 1.5,"1%FDR" = 1, "not" = 0.5))+
+            #scale_alpha_manual(name = "", 
+                     #values = c("0.1%FDR" = 0.75,"1%FDR" = 0.4, "not" = 0.05))+
+            scale_color_manual(name = "", 
+                     values = c("Mito_feature" = "#f56464" ,
+                                "AGP_feature" = "#f2cf41",
+                                "bodipy_feature" = "#4dac26",
+                                "DNA_feature" = "#65a6db",
+                                "other_feature" = "#959ca3"))+
+            #theme_bw() +
+            #theme(strip.background = element_rect(colour = "black",
+                                        #fill = "#fdfff4"))
+#####AND SO THE PLOT EXPORTS TO THE RIGHT PLACE#####
+pdf_path <- paste0(root_output_directory, "Scatter Plots/","SOPHIES VOLCANOLP profile OA 21% oxygen hepatocytes.pdf")
+pdf(pdf_path)
+print(plot)
+dev.off()
+write.table(volcano, file = "OA 21%oxygen hepatocytes.csv", sep = ",", col.names = NA,
+            qmethod = "double")
+
+#########MY CODE TO PLOT SOPHIE'S VOLCANO#########
+file_name<-"SOPHIE VOLCANO"
+    volcano_plot <- ggplot(volcano, aes(x= `t-test`, y=-log10(treat.pvalue))) +
+      geom_point(aes(color=feature_color))+
+      scale_color_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db", "other"="#959ca3"))+
+      xlab("t-statistics")+
+      ylab("-log10(pvalue)")+
+      ggtitle("Sophie's Volcano Plot")
+    
+    pdf_path <- paste0(root_output_directory, "Scatter Plots/", file_name, "_pvolcano_LP profile_hepatocytes.pdf")
+    pdf(pdf_path)
+    print(plot)
+    dev.off()
+
+#########MY CODE TO PLOT MY VOLCANO#########
+#MY FUNCTION ISN'T WORKING. THE VOLCANO PLOTS ARE COMING OUT DIFFERENTLY, AND I'M NOT SURE WHY
+#plot_volcano(my_results_df, p, 0.01, 0.5, "MY VOLCANO")
+data2plot<-my_results_df
+ylim<-0.5
+xlim<-0.01
+file_name<-"MY VOLCANO"
+    volcano_plot <- ggplot(data2plot, aes(x= `t-test`, y=-log10(comparison.pvalue))) +
+      geom_point(aes(color=feature_color))+
+      scale_color_manual(values = c("Mito"="#f56464","AGP"="#f2cf41","Lipid"="#4dac26","DNA"="#65a6db","Lipid/AGP"="#959ca3", "Lipid/DNA"="#959ca3", "Lipid/Mito"="#959ca3", "AGP/Mito"="#959ca3", "DNA/Mito"="#959ca3", "other"="#959ca3"))+
+      geom_hline(yintercept = -log10(ylim), linetype = "dashed") +
+      geom_vline(xintercept = c(-xlim,xlim), linetype = "dashed") +
+      ylab("-log10(pvalue)") +
+      ggtitle(paste0("pvalue Volcano Plot of ", file_name))
+    
+    pdf_path <- paste0(root_output_directory, "Scatter Plots/", file_name, "_pvolcano_LP profile_hepatocytes.pdf")
+    pdf(pdf_path)
+    print(plot)
+    dev.off()
+
+#########COMPARISON#########
+#VISUALLY COMPARE EXPORTED PLOTS
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
